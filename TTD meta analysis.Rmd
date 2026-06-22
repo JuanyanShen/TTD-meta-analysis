@@ -1,0 +1,497 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+
+```
+
+
+```{r}
+# 加载所需包
+library(readxl)
+library(meta)
+library(dmetar)
+rm(list = ls())
+# Excel 文件路径（需替换为你的实际文件路径）
+excel_file <- "D:/meta分析/9.1network meta/12.31/整合版数据1.3_TTD.xlsx"  
+
+# 获取 Excel 中所有 sheet 的名称
+sheet_names <- excel_sheets(excel_file)  
+
+library(readxl)
+library(meta)
+
+# ---------- 关键新增：创建空列表用于存储每个sheet的mg ----------
+mg_list <- list()  # 命名列表，键=sheet名，值=对应的mg对象
+
+# ---------- 0) 结果输出目录：若不存在就创建 ----------
+dir.create("forest_plots", recursive = TRUE, showWarnings = FALSE)
+dir.create("forest_plots/subgroup", recursive = TRUE, showWarnings = FALSE)
+dir.create("funnel_plots", recursive = TRUE, showWarnings = FALSE)
+dir.create("sensitivity_forest_plots", recursive = TRUE, showWarnings = FALSE)
+dir.create("leave_one_out_plots", recursive = TRUE, showWarnings = FALSE)
+
+# ---------- 1) 主循环 ----------
+for (sheet in sheet_names) {
+  
+  cat("==== Processing sheet:", sheet, "====\n")
+  
+  # ---- 1.1 读数据（用 tryCatch 防止单个 sheet 报错终止整个循环）----
+  dat <- tryCatch(
+    read_excel(excel_file, sheet = sheet),
+    error = function(e) {
+      cat("❌ 读取失败：", sheet, " -> ", conditionMessage(e), "\n")
+      return(NULL)
+    }
+  )
+  if (is.null(dat)) next
+  
+  # ---- 1.2 基础列检查（缺关键列就跳过）----
+  required_cols <- c("HR", "LCI", "UCI", "control_type", "treatment_type1", "Trial.name","treatment_type","masked")
+  miss_cols <- setdiff(required_cols, colnames(dat))
+  if (length(miss_cols) > 0) {
+    cat("⚠️ 跳过：", sheet, "缺少列：", paste(miss_cols, collapse = ", "), "\n")
+    next
+  }
+  
+  # ---- 1.3 数值化（HR/LCI/UCI）----
+  dat$HR  <- suppressWarnings(as.numeric(dat$HR))
+  dat$LCI <- suppressWarnings(as.numeric(dat$LCI))
+  dat$UCI <- suppressWarnings(as.numeric(dat$UCI))
+  
+  # ---- 1.4 研究筛选：对照=CT 且 treatment_type1 不缺失 ----
+  sub <- subset(dat, control_type == "CT" & !is.na(treatment_type1))
+  
+  # ---- 1.5 若 HR 缺失但有 logHR & SE(logHR)，则反推 HR/CI ----
+  # 注意：列名里带括号必须用反引号 `SE(logHR)`
+  has_log_cols <- all(c("logHR", "SE(logHR)") %in% colnames(sub))
+  if (has_log_cols) {
+    idx_need <- is.na(sub$HR) & !is.na(sub$logHR) & !is.na(sub$`SE(logHR)`)
+    if (any(idx_need)) {
+      sub$HR[idx_need]  <- exp(sub$logHR[idx_need])
+      sub$LCI[idx_need] <- exp(sub$logHR[idx_need] - 1.96 * sub$`SE(logHR)`[idx_need])
+      sub$UCI[idx_need] <- exp(sub$logHR[idx_need] + 1.96 * sub$`SE(logHR)`[idx_need])
+    }
+  }
+  
+  # ---- 1.6 过滤有效行：HR/LCI/UCI 必须齐全且 >0 ----
+  sub <- sub[complete.cases(sub$HR, sub$LCI, sub$UCI), ]
+  sub <- sub[sub$HR > 0 & sub$LCI > 0 & sub$UCI > 0, ]
+  
+  if (nrow(sub) == 0) {
+    cat("⚠️ 警告：", sheet, "过滤后无有效数据\n")
+    next
+  }
+  
+  # ---- 1.7 构造 TE 与 seTE（推荐显式给 seTE，最稳）----
+  # TE = log(HR)
+  # seTE ≈ (log(UCI)-log(LCI)) / (2*1.96)
+  sub$TE   <- log(sub$HR)
+  sub$seTE <- (log(sub$UCI) - log(sub$LCI)) / (2 * 1.96)
+  
+  # seTE 必须为正且非缺失
+  sub <- sub[is.finite(sub$TE) & is.finite(sub$seTE) & sub$seTE > 0, ]
+  if (nrow(sub) == 0) {
+    cat("⚠️ 警告：", sheet, "无法计算有效 seTE（可能CI不合理）\n")
+    next
+  }
+  
+  # ---- 1.8 Meta 分析 ----
+  mg <- tryCatch(
+    meta::metagen(
+      TE = TE,
+      seTE = seTE,
+      studlab = `Trial.name`,
+      sm = "HR",
+      n.e = N_E,
+      n.c  = N_C,
+      method.tau = "DL",
+      hakn = T,
+      prediction = F,
+      data = sub
+    ),
+    error = function(e) {
+      cat("❌ metagen 失败：", sheet, " -> ", conditionMessage(e), "\n")
+      return(NULL)
+    }
+  )
+  if (is.null(mg)) next
+  
+  # ---------- 关键新增：将当前sheet的mg存入列表 ----------
+  mg_list[[sheet]] <- mg  # 按sheet名称命名列表元素，避免覆盖
+  
+  # =========================
+  # 2) Forest plot
+  # =========================
+  plot_filename <- paste0("forest_plots/forest_plot_", gsub(" ", "_", sheet), ".pdf")
+  pdf(plot_filename, width = 12, height = 8)
+  p_val <- round(mg$pval.random, 4)
+  p_val_formatted <- ifelse(p_val < 0.001, "<0.001", paste("=", round(p_val, 4)))
+  meta::forest(
+    mg,
+    xlab = "Hazard Ratio (HR)",
+    leftcols = c("studlab", "n.e", "n.c"),
+    leftlabs = c("Study", "Experimental\n(N)", "Control\n(N)"),
+    print.tau2 = TRUE,
+    # layout = "JAMA",
+    main = paste("Forest Plot for Outcome:", sheet),
+    label.right = "Higher risk\nof deterioration",
+    label.left  = "Lower risk\nof deterioration",
+    # 核心：自定义汇总行标签，加入p值
+    summarylab = paste("Overall (p", p_val, ")", sep = ""),
+    # 可选：调整汇总行字体加粗
+    fontsize.summary = 12,
+    fontface.summary = "bold"
+  )
+  dev.off()
+  
+  # =========================
+  # 3) Funnel plot + Egger（稳健版，不会再报 text length 0）
+  # =========================
+  funnel_filename <- paste0("funnel_plots/funnel_plot_", gsub(" ", "_", sheet), ".pdf")
+  pdf(funnel_filename, width = 12, height = 8)
+  
+  meta::funnel(mg, main = paste("Funnel Plot for Outcome:", sheet))
+  
+  k <- mg$k
+  egger_text <- NULL
+  
+  if (!is.null(k) && is.finite(k) && k >= 10) {
+    eg <- tryCatch(
+      meta::metabias(mg, method.bias = "linreg"),
+      error = function(e) NULL
+    )
+    
+    pval <- NA_real_
+    if (!is.null(eg)) {
+      if (!is.null(eg$p.value) && length(eg$p.value) == 1) pval <- eg$p.value
+      if (is.na(pval) && !is.null(eg$p.value.bias) && length(eg$p.value.bias) == 1) pval <- eg$p.value.bias
+      if (is.na(pval) && !is.null(eg$bias$p.value) && length(eg$bias$p.value) == 1) pval <- eg$bias$p.value
+    }
+    
+    if (is.finite(pval)) {
+      egger_text <- sprintf("Egger regression test (linreg): p = %.3g (k = %d)", pval, k)
+    } else {
+      egger_text <- sprintf("Egger regression test (linreg): p not available (k = %d)", k)
+    }
+  } else {
+    egger_text <- sprintf(
+      "Egger regression test not performed (k = %s; recommended only when k \u2265 10)",
+      ifelse(is.null(k), "NA", as.character(k))
+    )
+  }
+  
+  mtext(egger_text, side = 3, line = 0.5, adj = 1, cex = 0.9)
+  dev.off()
+  
+  # =========================
+  # 4) Leave-one-out / influence（稳健：不让缺包中断）
+  # =========================
+  
+  # 4.1 metainf（meta 包自带）
+  sensitivity_filename <- paste0("sensitivity_forest_plots/sensitivity_forest_plot_", gsub(" ", "_", sheet), ".pdf")
+  pdf(sensitivity_filename, width = 12, height = 8)
+  
+  mi <- tryCatch(meta::metainf(mg, pooled = "random"), error = function(e) NULL)
+  if (!is.null(mi)) {
+    meta::forest(
+      mi,
+      comb.fixed = FALSE,
+      main = paste("Leave-one-out sensitivity (metainf):", sheet),
+      layout = "JAMA",
+      cex = 0.6
+    )
+  } else {
+    plot.new()
+    text(0.5, 0.5, "metainf failed / not available for this outcome", cex = 1)
+  }
+  dev.off()
+  
+  # 4.2 InfluenceAnalysis（常见来自 dmetar；可能你环境里没有）
+  # 如果没有该函数，就跳过，不报错
+  if (exists("InfluenceAnalysis")) {
+    m.gen.inf <- tryCatch(InfluenceAnalysis(mg, random = TRUE), error = function(e) NULL)
+    
+    leave_one_out_filename <- paste0("leave_one_out_plots/leave_one_out_plot_", gsub(" ", "_", sheet), ".pdf")
+    pdf(leave_one_out_filename, width = 12, height = 8)
+    
+    if (!is.null(m.gen.inf)) {
+      par(mar = c(4, 4, 2, 2))
+      plot(m.gen.inf, "i2")
+    } else {
+      plot.new()
+      text(0.5, 0.5, "InfluenceAnalysis failed for this outcome", cex = 1)
+    }
+    dev.off()
+  } else {
+    cat("ℹ️ InfluenceAnalysis() 未找到（可能未安装/未加载 dmetar），跳过 leave_one_out i2 图：", sheet, "\n")
+  }
+  
+  # =========================
+  # 5) 亚组分析：byvar = treatment_type（若 treatment_type 列存在才做）
+  # =========================
+  if ("masked" %in% colnames(sub)) {
+    
+    mg_sub <- tryCatch(
+      meta::metagen(
+        TE = TE,
+        seTE = seTE,
+        studlab = `Trial.name`,
+        sm = "HR",
+        n.e = N_E,
+        n.c  = N_C,
+        method.tau = "DL",
+        hakn = T,
+        byvar = masked,
+        data = sub
+      ),
+      error = function(e) NULL
+    )
+    
+    if (!is.null(mg_sub)) {
+      plot_filename2 <- paste0("forest_plots/subgroup/forest_", gsub(" ", "_", sheet), "_masked.pdf")
+      pdf(plot_filename2, width = 12, height = 8)
+      
+      meta::forest(
+        mg_sub,
+        xlab = "Hazard Ratio (HR)",
+        leftcols = c("studlab", "n.e", "n.c"),
+        leftlabs = c("Study", "Experimental\n(N)", "Control\n(N)"),
+        print.tau2 = TRUE,
+        #layout = "JAMA",
+        print.byvar = TRUE,
+        overall = TRUE,
+        main = paste(sheet, "- Subgroup analysis: masked"),
+        label.right = "Higher risk\nof deterioration",
+        label.left  = "Lower risk\nof deterioration"
+      )
+      dev.off()
+    } else {
+      cat("⚠️ 亚组分析失败（masked）：", sheet, "\n")
+    }
+    
+  } else {
+    cat("p：", p_val, "\n")
+  }
+  
+  cat("p", p_val_formatted,":", sheet, "\n\n")
+}
+
+# ---------- 关键新增：保存mg_list到文件（可选但推荐） ----------
+# 方式1：保存为RData（可存多个对象，加载后直接调用mg_list）
+save(mg_list, file = "meta_analysis_mg_objects.RData")
+
+# 方式2：保存为RDS（单个对象，更轻量）
+saveRDS(mg_list, file = "meta_analysis_mg_objects.rds")
+
+cat("✅ 所有有效sheet的mg已存入mg_list列表，并保存为RData/RDS文件！\n")
+
+```
+
+```{r}
+find.outliers(mg)
+library(dplyr)
+m.gen.inf <- InfluenceAnalysis(mg, random =TRUE)
+summary(m.gen.inf)
+plot(m.gen.inf,"baujat")
+plot(m.gen.inf,"influence")
+update(mg, exclude = 6) %>% summary()
+summary(mg)
+
+
+
+update(mg, subgroup = sub$ROB, tau.common = TRUE)
+eggers.test(mg)
+
+metabias(mg, method.bias = "Pustejovsky",k.min = 5)
+```
+
+#循环跑 univariable metareg + 汇总结果
+```{r}
+regression_data<-read_excel("D:/meta分析/9.1network meta/2025.12.25/meta regression data.xlsx")
+mg1<-mg_list$
+mg1$data<-merge(mg1$data,regression_data,by="Study.ID")
+m.gen.reg <- metareg(mg1, ~treatment_type)
+
+library(meta)
+library(dplyr)
+
+
+vars <- c(
+  "Age_ICI_Median", "Female", "Male",
+  "Asia", "Sq", "Non_sq",
+  "Ne_PD_L1", "High_PD_L1",
+  "ECOG_0", "ECOG_2",
+  "Brain metastasis", "Never smoking"
+)
+
+res <- vector("list", length(vars))
+names(res) <- vars
+
+# 安全取值：NULL 或长度0 -> NA
+get1 <- function(x) if (is.null(x) || length(x) == 0) NA_real_ else x[1]
+
+for (v in vars) {
+  fml <- as.formula(paste0("~ `", v, "`"))
+  
+  fit <- tryCatch(metareg(mg, fml), error = function(e) e)
+  
+  if (inherits(fit, "error")) {
+    res[[v]] <- data.frame(
+      moderator = v,
+      k = NA_integer_,
+      beta = NA_real_,
+      se = NA_real_,
+      p = NA_real_,
+      I2 = NA_real_,
+      error = fit$message,
+      stringsAsFactors = FALSE
+    )
+    next
+  }
+  
+  # 有些变量会导致“只有截距没有协变量系数”
+  # metareg 对象里通常系数在 beta/se 或 coeffs 这类字段；最稳的方式是先看 pval 是否有第2个
+  p2 <- if (!is.null(fit$pval) && length(fit$pval) >= 2) fit$pval[2] else NA_real_
+  
+  # beta/se 的位置在不同版本略有差异：优先用 fit$beta / fit$se
+  b2  <- if (!is.null(fit$beta) && length(fit$beta) >= 2) fit$beta[2] else NA_real_
+  se2 <- if (!is.null(fit$se)   && length(fit$se)   >= 2) fit$se[2]   else NA_real_
+  
+  # 研究数 k：常见字段是 k 或 k.w / k.all（不同版本不同），这里做兜底
+  k_used <- get1(fit$k)
+  if (is.na(k_used)) k_used <- get1(fit$k.w)
+  if (is.na(k_used)) k_used <- get1(fit$k.all)
+  
+  res[[v]] <- data.frame(
+    moderator = v,
+    k = as.integer(k_used),
+    beta = b2,
+    se = se2,
+    p = p2,
+    I2 = get1(fit$I2),
+    error = ifelse(is.na(p2) && is.na(b2) && is.na(se2),
+                   "No slope estimated (moderator constant or missing).",
+                   NA_character_),
+    stringsAsFactors = FALSE
+  )
+}
+
+res_tab <- do.call(rbind, res)
+
+# 多重比较校正（你要的“调整后的p值”）
+res_tab$p_adj_FDR <- p.adjust(res_tab$p, method = "BH")            # 推荐
+# 如需 Bonferroni 也可以加一列：
+res_tab$p_adj_Bonf <- p.adjust(res_tab$p, method = "bonferroni")
+
+# 保存
+write.csv(res_tab, "univariable_metareg_results_with_fatigue.csv", row.names = FALSE)
+
+res_tab
+
+
+```
+
+```{r}
+# 方法1：直接指定镜像地址（推荐清华镜像）
+options(repos = c(
+  CRAN="https://mirrors.tuna.tsinghua.edu.cn/CRAN/",  # 清华CRAN镜像
+  Bioconductor="https://mirrors.tuna.tsinghua.edu.cn/bioconductor/"  # 清华Bioconductor镜像（如需）
+))
+
+study_data_sorted <- sub %>% arrange(Year)
+# 进行累积Meta分析
+cumulative_meta <- metacum(mg,
+             sortvar = study_data_sorted$Year,
+             pooled ="random") # 使用随机效应模型
+
+# 查看结果
+summary(cumulative_meta)
+
+# 绘制累积森林图
+library(meta)
+
+# 注意：TSA需要安装额外的包
+if(!require(tsaR)) install.packages("tsaR")
+library(tsaR)
+
+# 提取效应量和标准误
+effects <- cumulative_meta$TE
+se <- cumulative_meta$seTE
+n_cum <- cumulative_meta$n.e + cumulative_meta$n.c
+
+# 进行试验序贯分析
+tsa_result <- tsa(effects, se, n_cum,
+        alpha =0.05, # 显著性水平
+        beta =0.2,  # 检验效能为80%
+        delta = -3,  # 临床相关的效应量
+        method ="OBF")# O'Brien-Fleming边界
+
+# 绘制TSA图
+plot(tsa_result, main ="降压药物效果的试验序贯分析")
+```
+
+
+```{r}
+qol<-mg_list$QoL$data
+# 1) Pearson相关（对应文中“correlation between HRs of PFS and OS”）
+cor_test <- cor.test(qol$HR, qol$HR.OS, method = "pearson")
+cor_test
+
+# 1) 反推SE(logHR)
+dat2 <- qol %>%
+  mutate(
+    logHR_PFS = log(HR),
+    se_PFS    = (log(UCI) - log(LCI)) / (2*1.96),
+    logHR_OS  = log(HR.OS),
+    se_OS     = (log(UCI.OS) - log(LCI.OS)) / (2*1.96)
+  )
+
+# 2) 计算log(rHR)与SE
+dat2 <- dat2 %>%
+  mutate(
+    log_rHR = logHR_PFS - logHR_OS,
+    se_rHR  = sqrt(se_PFS^2 + se_OS^2),
+    rHR     = exp(log_rHR),
+    rHR_LCI = exp(log_rHR - 1.96*se_rHR),
+    rHR_UCI = exp(log_rHR + 1.96*se_rHR)
+  )
+
+dat2 %>% select(trial, rHR, rHR_LCI, rHR_UCI)
+
+# 3) 随机效应合并（Gyawali写的是random-effects）
+library(metafor)
+m_rhr <- rma(yi = log_rHR, sei = se_rHR, method = "DL", data = dat2)  # DL仅作示例
+m_rhr
+
+# 4) 输出合并rHR
+pooled_rHR <- exp(c(m_rhr$b, m_rhr$ci.lb, m_rhr$ci.ub))
+names(pooled_rHR) <- c("pooled_rHR","LCI","UCI")
+pooled_rHR
+
+mg1<-metagen(
+        TE = log_rHR,
+        seTE = se_rHR,
+        studlab = `Trial.name`,
+        sm = "HR",
+        n.e = N_E,
+        n.c  = N_C,
+        method.tau = "DL",
+        hakn = F,
+        byvar = masked,
+        data = dat2
+      )
+# 5) 森林图（类似文中 Figure）
+forest(mg1, slab = dat2$Trial.name, atransf = exp,
+       xlab = "rHR = HR(QoL) / HR(OS)")
+
+m.gen.inf <- InfluenceAnalysis(mg1, random =TRUE)
+summary(m.gen.inf)
+plot(m.gen.inf,"baujat")
+plot(m.gen.inf,"influence")
+update(mg1, exclude = c(4,5)) %>% summary()
+summary(mg)
+
+```
+
