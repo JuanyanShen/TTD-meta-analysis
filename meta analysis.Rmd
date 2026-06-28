@@ -1,0 +1,810 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+rm(list = ls())
+library(knitr)
+# 1. knitr渲染根目录
+opts_knit$set(root.dir = "D:/meta分析/9.1network meta/2026.6.25")
+# 2. 强制切换真实工作目录（解决交互式getwd错乱）
+wd <- "D:/meta分析/9.1network meta/2026.6.25"
+if(dir.exists(wd)) setwd(wd)
+# 验证
+getwd()
+```
+
+```{r}
+library(readxl)
+library(meta)
+library(dmetar)
+# Excel 文件路径（需替换为你的实际文件路径）
+excel_file <- "D:/meta分析/9.1network meta/2026.6.23/整合版数据6.23_TTD_新增n_event.xlsx"  
+
+# 获取 Excel 中所有 sheet 的名称
+sheet_names <- excel_sheets(excel_file)  
+
+library(readxl)
+library(meta)
+
+# ---------- 关键新增：创建空列表用于存储每个sheet的mg ----------
+mg_list <- list()  # 命名列表，键=sheet名，值=对应的mg对象
+
+# ---------- 0) 结果输出目录：若不存在就创建 ----------
+dir.create("forest_plots", recursive = TRUE, showWarnings = FALSE)
+dir.create("forest_plots/subgroup", recursive = TRUE, showWarnings = FALSE)
+dir.create("funnel_plots", recursive = TRUE, showWarnings = FALSE)
+dir.create("sensitivity_forest_plots", recursive = TRUE, showWarnings = FALSE)
+dir.create("leave_one_out_plots", recursive = TRUE, showWarnings = FALSE)
+
+# ---------- 1) 主循环 ----------
+for (sheet in sheet_names) {
+  
+  cat("==== Processing sheet:", sheet, "====\n")
+  
+  # ---- 1.1 读数据（用 tryCatch 防止单个 sheet 报错终止整个循环）----
+  dat <- tryCatch(
+    read_excel(excel_file, sheet = sheet),
+    error = function(e) {
+      cat("❌ 读取失败：", sheet, " -> ", conditionMessage(e), "\n")
+      return(NULL)
+    }
+  )
+  if (is.null(dat)) next
+  
+  # ---- 1.2 基础列检查（缺关键列就跳过）----
+  required_cols <- c("HR", "LCI", "UCI", "control_type", "treatment_type1", "Trial.name","treatment_type")
+  miss_cols <- setdiff(required_cols, colnames(dat))
+  if (length(miss_cols) > 0) {
+    cat("⚠️ 跳过：", sheet, "缺少列：", paste(miss_cols, collapse = ", "), "\n")
+    next
+  }
+  
+  # ---- 1.3 数值化（HR/LCI/UCI）----
+  dat$HR  <- suppressWarnings(as.numeric(dat$HR))
+  dat$LCI <- suppressWarnings(as.numeric(dat$LCI))
+  dat$UCI <- suppressWarnings(as.numeric(dat$UCI))
+  
+  # ---- 1.4 研究筛选：对照=CT 且 treatment_type1 不缺失 ----
+  sub <- subset(dat, control_type == "CT" & !is.na(treatment_type1))
+  
+  # ---- 1.5 若 HR 缺失但有 logHR & SE(logHR)，则反推 HR/CI ----
+  # 注意：列名里带括号必须用反引号 `SE(logHR)`
+  has_log_cols <- all(c("logHR", "SE(logHR)") %in% colnames(sub))
+  if (has_log_cols) {
+    idx_need <- is.na(sub$HR) & !is.na(sub$logHR) & !is.na(sub$`SE(logHR)`)
+    if (any(idx_need)) {
+      sub$HR[idx_need]  <- exp(sub$logHR[idx_need])
+      sub$LCI[idx_need] <- exp(sub$logHR[idx_need] - 1.96 * sub$`SE(logHR)`[idx_need])
+      sub$UCI[idx_need] <- exp(sub$logHR[idx_need] + 1.96 * sub$`SE(logHR)`[idx_need])
+    }
+  }
+  
+  # ---- 1.6 过滤有效行：HR/LCI/UCI 必须齐全且 >0 ----
+  sub <- sub[complete.cases(sub$HR, sub$LCI, sub$UCI), ]
+  sub <- sub[sub$HR > 0 & sub$LCI > 0 & sub$UCI > 0, ]
+  
+  if (nrow(sub) == 0) {
+    cat("⚠️ 警告：", sheet, "过滤后无有效数据\n")
+    next
+  }
+  
+  # ---- 1.7 构造 TE 与 seTE（推荐显式给 seTE，最稳）----
+  # TE = log(HR)
+  # seTE ≈ (log(UCI)-log(LCI)) / (2*1.96)
+  sub$TE   <- log(sub$HR)
+  sub$seTE <- (log(sub$UCI) - log(sub$LCI)) / (2 * 1.96)
+  
+  # seTE 必须为正且非缺失
+  sub <- sub[is.finite(sub$TE) & is.finite(sub$seTE) & sub$seTE > 0, ]
+  if (nrow(sub) == 0) {
+    cat("⚠️ 警告：", sheet, "无法计算有效 seTE（可能CI不合理）\n")
+    next
+  }
+  
+  # ---- 1.8 Meta 分析 ----
+  mg <- tryCatch(
+    meta::metagen(
+      TE = TE,
+      seTE = seTE,
+      studlab = `Trial.name`,
+      sm = "HR",
+      n.e = N_E,
+      n.c  = N_C,
+      method.tau = "DL",
+      hakn = T,
+      fixed = FALSE,
+      prediction = F,
+      data = sub
+    ),
+    error = function(e) {
+      cat("❌ metagen 失败：", sheet, " -> ", conditionMessage(e), "\n")
+      return(NULL)
+    }
+  )
+  if (is.null(mg)) next
+  
+  # ---------- 关键新增：将当前sheet的mg存入列表 ----------
+  mg_list[[sheet]] <- mg  # 按sheet名称命名列表元素，避免覆盖
+  
+  # =========================
+  # 2) Forest plot
+  # =========================
+  plot_filename <- paste0("forest_plots/forest_plot_", gsub(" ", "_", sheet), ".pdf")
+  pdf(plot_filename, width = 12, height = 8)
+  p_val <- round(mg$pval.random, 4)
+  p_val_formatted <- ifelse(p_val < 0.001, "<0.001", paste("=", round(p_val, 4)))
+  meta::forest(
+    mg,
+    xlab = "Hazard Ratio (HR)",
+    leftcols = c("studlab", "n.e", "n.c"),
+    leftlabs = c("Study", "Experimental\n(N)", "Control\n(N)"),
+    print.tau2 = TRUE,
+    # layout = "JAMA",
+    main = paste("Forest Plot for Outcome:", sheet),
+    test.overall = TRUE,
+    label.right = "Higher risk\nof deterioration",
+    label.left  = "Lower risk\nof deterioration",
+    # 核心：自定义汇总行标签，加入p值
+    summarylab = paste("Overall (p", p_val, ")", sep = ""),
+    # 可选：调整汇总行字体加粗
+    fontsize.summary = 12,
+    fontface.summary = "bold"
+  )
+  dev.off()
+  
+  # =========================
+  # 3) Funnel plot + Egger（稳健版，不会再报 text length 0）
+  # =========================
+  funnel_filename <- paste0("funnel_plots/funnel_plot_", gsub(" ", "_", sheet), ".pdf")
+  pdf(funnel_filename, width = 12, height = 8)
+  
+  meta::funnel(mg, main = paste("Funnel Plot for Outcome:", sheet))
+  
+  k <- mg$k
+  egger_text <- NULL
+  
+  if (!is.null(k) && is.finite(k) && k >= 10) {
+    eg <- tryCatch(
+      meta::metabias(mg, method.bias = "linreg"),
+      error = function(e) NULL
+    )
+    
+    pval <- NA_real_
+    if (!is.null(eg)) {
+      if (!is.null(eg$p.value) && length(eg$p.value) == 1) pval <- eg$p.value
+      if (is.na(pval) && !is.null(eg$p.value.bias) && length(eg$p.value.bias) == 1) pval <- eg$p.value.bias
+      if (is.na(pval) && !is.null(eg$bias$p.value) && length(eg$bias$p.value) == 1) pval <- eg$bias$p.value
+    }
+    
+    if (is.finite(pval)) {
+      egger_text <- sprintf("Egger regression test (linreg): p = %.3g (k = %d)", pval, k)
+    } else {
+      egger_text <- sprintf("Egger regression test (linreg): p not available (k = %d)", k)
+    }
+  } else {
+    egger_text <- sprintf(
+      "Egger regression test not performed (k = %s; recommended only when k \u2265 10)",
+      ifelse(is.null(k), "NA", as.character(k))
+    )
+  }
+  
+  mtext(egger_text, side = 3, line = 0.5, adj = 1, cex = 0.9)
+  dev.off()
+  
+  # =========================
+  # 4) Leave-one-out / influence（稳健：不让缺包中断）
+  # =========================
+  
+  # 4.1 metainf（meta 包自带）
+  sensitivity_filename <- paste0("sensitivity_forest_plots/sensitivity_forest_plot_", gsub(" ", "_", sheet), ".pdf")
+  pdf(sensitivity_filename, width = 12, height = 8)
+  
+  mi <- tryCatch(meta::metainf(mg, pooled = "random"), error = function(e) NULL)
+  if (!is.null(mi)) {
+    meta::forest(
+      mi,
+      comb.fixed = FALSE,
+      main = paste("Leave-one-out sensitivity (metainf):", sheet),
+      layout = "JAMA",
+      cex = 0.6
+    )
+  } else {
+    plot.new()
+    text(0.5, 0.5, "metainf failed / not available for this outcome", cex = 1)
+  }
+  dev.off()
+  
+  # 4.2 InfluenceAnalysis（常见来自 dmetar；可能你环境里没有）
+  # 如果没有该函数，就跳过，不报错
+  if (exists("InfluenceAnalysis")) {
+    m.gen.inf <- tryCatch(InfluenceAnalysis(mg, random = TRUE), error = function(e) NULL)
+    
+    leave_one_out_filename <- paste0("leave_one_out_plots/leave_one_out_plot_", gsub(" ", "_", sheet), ".pdf")
+    pdf(leave_one_out_filename, width = 12, height = 8)
+    
+    if (!is.null(m.gen.inf)) {
+      par(mar = c(4, 4, 2, 2))
+      plot(m.gen.inf, "i2")
+    } else {
+      plot.new()
+      text(0.5, 0.5, "InfluenceAnalysis failed for this outcome", cex = 1)
+    }
+    dev.off()
+  } else {
+    cat("ℹ️ InfluenceAnalysis() 未找到（可能未安装/未加载 dmetar），跳过 leave_one_out i2 图：", sheet, "\n")
+  }
+  
+  # =========================
+  # 5) 亚组分析：byvar = treatment_type（若 treatment_type 列存在才做）
+  # =========================
+  if ("treatment_type" %in% colnames(sub)) {
+    
+    mg_sub <- tryCatch(
+      meta::metagen(
+        TE = TE,
+        seTE = seTE,
+        studlab = `Trial.name`,
+        sm = "HR",
+        n.e = N_E,
+        n.c  = N_C,
+        method.tau = "DL",
+        hakn = T,
+        fixed = FALSE,
+        byvar = treatment_type,
+        data = sub
+      ),
+      error = function(e) NULL
+    )
+    
+    if (!is.null(mg_sub)) {
+      plot_filename2 <- paste0("forest_plots/subgroup/forest_", gsub(" ", "_", sheet), "_treatment_type.pdf")
+      pdf(plot_filename2, width = 12, height = 8)
+      
+      meta::forest(
+        mg_sub,
+        xlab = "Hazard Ratio (HR)",
+        leftcols = c("studlab", "n.e", "n.c"),
+        leftlabs = c("Study", "Experimental\n(N)", "Control\n(N)"),
+        print.tau2 = TRUE,
+        #layout = "JAMA",
+        print.byvar = TRUE,
+        overall = TRUE,
+        main = paste(sheet, "- Subgroup analysis: treatment_type"),
+        label.right = "Higher risk\nof deterioration",
+        label.left  = "Lower risk\nof deterioration"
+      )
+      dev.off()
+    } else {
+      cat("⚠️ 亚组分析失败（treatment_type）：", sheet, "\n")
+    }
+    
+  } else {
+    cat("p：", p_val, "\n")
+  }
+  
+  cat("p", p_val_formatted,":", sheet, "\n\n")
+}
+
+# ---------- 关键新增：保存mg_list到文件（可选但推荐） ----------
+# 方式1：保存为RData（可存多个对象，加载后直接调用mg_list）
+save(mg_list, file = "meta_analysis_mg_objects.RData")
+
+# 方式2：保存为RDS（单个对象，更轻量）
+saveRDS(mg_list, file = "meta_analysis_mg_objects.rds")
+
+cat("✅ 所有有效sheet的mg已存入mg_list列表，并保存为RData/RDS文件！\n")
+```
+
+```{r the association os and qol old, eval=FALSE}
+library(dplyr)
+fa<-mg_list$EF$data
+OS<-read_excel("D:/meta分析/9.1network meta/2026.6.23/整合版数据6.23_TTD_新增n_event.xlsx",sheet = "QOL")
+OS<-OS%>%
+  select("Study.ID","HR.OS" , "LCI.OS" ,"UCI.OS")
+qol<-merge(fa,OS,by="Study.ID")
+# 1) Pearson相关（对应文中“correlation between HRs of PFS and OS”）
+cor_test <- cor.test(qol$HR, qol$HR.OS, method = "pearson")
+cor_test
+# 2) 线性回归（文中说“whenever correlation was significant, we conducted linear regression”）
+fit <- lm(HR.OS ~ HR, data = qol)
+summary(fit)   # R^2 和 p 值就在这里
+library(ggplot2)
+# 3) 作图（类似 eFigure 4）
+p<-ggplot(qol, aes(x = HR, y = HR.OS)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "TTD of EF Hazard Ratio", y = "OS Hazard Ratio")
+
+# 保存图形（最常用的PNG格式，可根据需求调整参数）
+ggsave(
+  filename = "HR_EF_OS_scatter.pdf",  # 保存的文件名（含格式）
+  plot = p,                            # 要保存的图形对象
+  width = 6,                           # 宽度（单位：英寸）
+  height = 5,                          # 高度（单位：英寸）
+  dpi = 300,                           # 分辨率（300dpi适合论文/期刊）
+  bg = "white"                         # 背景色（避免透明背景）
+)
+
+# 1) 反推SE(logHR)
+dat2 <- qol %>%
+  mutate(
+    logHR_PFS = log(HR),
+    se_PFS    = (log(UCI) - log(LCI)) / (2*1.96),
+    logHR_OS  = log(HR.OS),
+    se_OS     = (log(UCI.OS) - log(LCI.OS)) / (2*1.96)
+  )
+
+# 2) 计算log(rHR)与SE
+dat2 <- dat2 %>%
+  mutate(
+    log_rHR = logHR_PFS - logHR_OS,
+    se_rHR  = sqrt(se_PFS^2 + se_OS^2),
+    rHR     = exp(log_rHR),
+    rHR_LCI = exp(log_rHR - 1.96*se_rHR),
+    rHR_UCI = exp(log_rHR + 1.96*se_rHR)
+  )
+
+dat2 %>% select(Study.ID, rHR, rHR_LCI, rHR_UCI)
+
+# 3) 随机效应合并（Gyawali写的是random-effects）
+library(metafor)
+m_rhr <- rma(yi = log_rHR, sei = se_rHR, method = "DL", data = dat2)  # DL仅作示例
+m_rhr
+
+# 4) 输出合并rHR
+pooled_rHR <- exp(c(m_rhr$b, m_rhr$ci.lb, m_rhr$ci.ub))
+names(pooled_rHR) <- c("pooled_rHR","LCI","UCI")
+pooled_rHR
+
+mg1<-metagen(
+        TE = log_rHR,
+        seTE = se_rHR,
+        studlab = `Trial.name`,
+        sm = "HR",
+        n.e = N_E,
+        n.c  = N_C,
+        method.tau = "DL",
+        hakn = T,
+        fixed = FALSE,
+        data = dat2
+      )
+# 5) 森林图（类似文中 Figure）
+forest(mg1, slab = dat2$Trial.name, atransf = exp,
+       xlab = "rHR = HR(QoL) / HR(OS)")
+
+m.gen.inf <- InfluenceAnalysis(mg1, random =TRUE)
+summary(m.gen.inf)
+plot(m.gen.inf,"baujat")
+plot(m.gen.inf,"influence")
+update(mg1, exclude = c(4,5)) %>% summary()
+summary(mg)
+
+```
+
+```{r association os and each qol sheet}
+library(dplyr)
+library(ggplot2)
+library(metafor)
+library(meta)
+library(readxl)
+
+# -------------------------------------------------------------------------
+# Association between each QoL/PRO TTD outcome sheet and OS
+# -------------------------------------------------------------------------
+# OS HR/CI are stored in the QOL sheet and are matched by Study.ID.
+OS <- read_excel(excel_file, sheet = "QOL") %>%
+  select(Study.ID, HR.OS, LCI.OS, UCI.OS) %>%
+  mutate(
+    HR.OS  = suppressWarnings(as.numeric(HR.OS)),
+    LCI.OS = suppressWarnings(as.numeric(LCI.OS)),
+    UCI.OS = suppressWarnings(as.numeric(UCI.OS))
+  ) %>%
+  filter(
+    !is.na(Study.ID),
+    is.finite(HR.OS), is.finite(LCI.OS), is.finite(UCI.OS),
+    HR.OS > 0, LCI.OS > 0, UCI.OS > 0
+  ) %>%
+  distinct(Study.ID, .keep_all = TRUE)
+
+dir.create("association_os_qol", recursive = TRUE, showWarnings = FALSE)
+dir.create("association_os_qol/scatter", recursive = TRUE, showWarnings = FALSE)
+dir.create("association_os_qol/rHR_forest", recursive = TRUE, showWarnings = FALSE)
+dir.create("association_os_qol/influence", recursive = TRUE, showWarnings = FALSE)
+
+safe_filename <- function(x) {
+  x <- gsub("[^A-Za-z0-9_\\-]+", "_", x)
+  x <- gsub("_+", "_", x)
+  x <- gsub("^_|_$", "", x)
+  ifelse(nchar(x) == 0, "sheet", x)
+}
+
+association_results <- list()
+rhr_results <- list()
+association_detail <- list()
+
+for (outcome_name in names(mg_list)) {
+  cat("==== OS association:", outcome_name, "====\n")
+  
+  fa <- mg_list[[outcome_name]]$data
+  if (is.null(fa) || nrow(fa) == 0) {
+    cat("Skip:", outcome_name, "has no mg$data\n")
+    next
+  }
+  
+  needed_cols <- c("Study.ID", "HR", "LCI", "UCI", "Trial.name")
+  missing_cols <- setdiff(needed_cols, colnames(fa))
+  if (length(missing_cols) > 0) {
+    cat("Skip:", outcome_name, "missing columns:", paste(missing_cols, collapse = ", "), "\n")
+    next
+  }
+  
+  qol <- fa %>%
+    mutate(
+      HR  = suppressWarnings(as.numeric(HR)),
+      LCI = suppressWarnings(as.numeric(LCI)),
+      UCI = suppressWarnings(as.numeric(UCI))
+    ) %>%
+    inner_join(OS, by = "Study.ID") %>%
+    filter(
+      is.finite(HR), is.finite(LCI), is.finite(UCI),
+      is.finite(HR.OS), is.finite(LCI.OS), is.finite(UCI.OS),
+      HR > 0, LCI > 0, UCI > 0,
+      HR.OS > 0, LCI.OS > 0, UCI.OS > 0
+    )
+  
+  association_detail[[outcome_name]] <- qol %>%
+    mutate(outcome = outcome_name) %>%
+    select(outcome, Study.ID, Trial.name, HR, LCI, UCI, HR.OS, LCI.OS, UCI.OS, everything())
+  
+  if (nrow(qol) < 3) {
+    association_results[[outcome_name]] <- data.frame(
+      outcome = outcome_name,
+      n_studies = nrow(qol),
+      pearson_r = NA_real_,
+      pearson_p = NA_real_,
+      lm_beta = NA_real_,
+      lm_p = NA_real_,
+      lm_r2 = NA_real_,
+      note = "Skipped: fewer than 3 matched studies"
+    )
+    cat("Skip correlation/regression:", outcome_name, "has fewer than 3 matched studies\n")
+    next
+  }
+  
+  cor_test <- tryCatch(
+    cor.test(qol$HR, qol$HR.OS, method = "pearson"),
+    error = function(e) NULL
+  )
+  fit <- tryCatch(lm(HR.OS ~ HR, data = qol), error = function(e) NULL)
+  fit_sum <- if (!is.null(fit)) summary(fit) else NULL
+  
+  association_results[[outcome_name]] <- data.frame(
+    outcome = outcome_name,
+    n_studies = nrow(qol),
+    pearson_r = if (!is.null(cor_test)) unname(cor_test$estimate) else NA_real_,
+    pearson_p = if (!is.null(cor_test)) cor_test$p.value else NA_real_,
+    lm_beta = if (!is.null(fit)) unname(coef(fit)["HR"]) else NA_real_,
+    lm_p = if (!is.null(fit_sum)) coef(fit_sum)["HR", "Pr(>|t|)"] else NA_real_,
+    lm_r2 = if (!is.null(fit_sum)) fit_sum$r.squared else NA_real_,
+    note = NA_character_
+  )
+  
+  p <- ggplot(qol, aes(x = HR, y = HR.OS)) +
+    geom_point(size = 2.5) +
+    geom_smooth(method = "lm", se = FALSE) +
+    labs(
+      x = paste0("TTD of ", outcome_name, " Hazard Ratio"),
+      y = "OS Hazard Ratio",
+      title = paste0("Association between TTD of ", outcome_name, " and OS")
+    ) +
+    theme_bw()
+  
+  ggsave(
+    filename = file.path("association_os_qol/scatter", paste0("HR_", safe_filename(outcome_name), "_OS_scatter.pdf")),
+    plot = p,
+    width = 6,
+    height = 5,
+    dpi = 300,
+    bg = "white"
+  )
+  
+  dat2 <- qol %>%
+    mutate(
+      logHR_QoL = log(HR),
+      se_QoL    = (log(UCI) - log(LCI)) / (2 * 1.96),
+      logHR_OS  = log(HR.OS),
+      se_OS     = (log(UCI.OS) - log(LCI.OS)) / (2 * 1.96),
+      log_rHR   = logHR_QoL - logHR_OS,
+      se_rHR    = sqrt(se_QoL^2 + se_OS^2),
+      rHR       = exp(log_rHR),
+      rHR_LCI   = exp(log_rHR - 1.96 * se_rHR),
+      rHR_UCI   = exp(log_rHR + 1.96 * se_rHR)
+    ) %>%
+    filter(is.finite(log_rHR), is.finite(se_rHR), se_rHR > 0)
+  
+  if (nrow(dat2) < 2) {
+    rhr_results[[outcome_name]] <- data.frame(
+      outcome = outcome_name,
+      n_studies = nrow(dat2),
+      pooled_rHR = NA_real_,
+      LCI = NA_real_,
+      UCI = NA_real_,
+      p_value = NA_real_,
+      I2 = NA_real_,
+      note = "Skipped: fewer than 2 studies for rHR pooling"
+    )
+    cat("Skip rHR pooling:", outcome_name, "has fewer than 2 valid studies\n")
+    next
+  }
+  
+  m_rhr <- tryCatch(
+    metafor::rma(yi = log_rHR, sei = se_rHR, method = "DL", data = dat2),
+    error = function(e) NULL
+  )
+  
+  if (!is.null(m_rhr)) {
+    rhr_results[[outcome_name]] <- data.frame(
+      outcome = outcome_name,
+      n_studies = nrow(dat2),
+      pooled_rHR = exp(as.numeric(m_rhr$b)),
+      LCI = exp(m_rhr$ci.lb),
+      UCI = exp(m_rhr$ci.ub),
+      p_value = m_rhr$pval,
+      I2 = m_rhr$I2,
+      note = NA_character_
+    )
+  }
+  
+  mg_rhr <- tryCatch(
+    meta::metagen(
+      TE = log_rHR,
+      seTE = se_rHR,
+      studlab = Trial.name,
+      sm = "HR",
+      method.tau = "DL",
+      hakn = TRUE,
+      fixed = FALSE,
+      random = TRUE,
+      data = dat2
+    ),
+    error = function(e) NULL
+  )
+  
+  if (!is.null(mg_rhr)) {
+    pdf(file.path("association_os_qol/rHR_forest", paste0("rHR_", safe_filename(outcome_name), "_forest.pdf")),
+        width = 9, height = 7)
+    meta::forest(
+      mg_rhr,
+      xlab = paste0("rHR = HR(", outcome_name, " TTD) / HR(OS)"),
+      backtransf = TRUE,
+      comb.fixed = FALSE,
+      comb.random = TRUE,
+      layout = "JAMA"
+    )
+    dev.off()
+    
+    if (exists("InfluenceAnalysis")) {
+      inf <- tryCatch(InfluenceAnalysis(mg_rhr, random = TRUE), error = function(e) NULL)
+      if (!is.null(inf)) {
+        pdf(file.path("association_os_qol/influence", paste0("rHR_", safe_filename(outcome_name), "_influence.pdf")),
+            width = 9, height = 7)
+        plot(inf, "influence")
+        dev.off()
+      }
+    }
+  }
+}
+
+association_summary <- bind_rows(association_results)
+rhr_summary <- bind_rows(rhr_results)
+association_detail_df <- bind_rows(association_detail)
+
+write.csv(association_summary, "association_os_qol/association_summary.csv", row.names = FALSE)
+write.csv(rhr_summary, "association_os_qol/rHR_summary.csv", row.names = FALSE)
+write.csv(association_detail_df, "association_os_qol/association_detail_matched_studies.csv", row.names = FALSE)
+saveRDS(
+  list(
+    association_summary = association_summary,
+    rhr_summary = rhr_summary,
+    association_detail = association_detail
+  ),
+  "association_os_qol/association_os_qol_results.rds"
+)
+
+association_summary
+rhr_summary
+```
+
+#做剔除影响异质性的研究后的森林图，pain中的研究是EMPOWER-Lung 3 part 2
+```{r}
+library(readxl)
+library(meta)
+
+# 1. 文件路径与文件夹创建
+excel_file <- "D:/meta分析/9.1network meta/2026.6.23/整合版数据6.23_TTD_新增n_event.xlsx"
+dir.create("forest_plots/excl_outlier", recursive = TRUE, showWarnings = FALSE)
+
+# 2. 单独读取Pain工作表并清洗（和你循环筛选逻辑完全统一）
+dat <- read_excel(excel_file, sheet = "Pain")#做剔除影响异质性的研究后的森林图，pain中的研究是EMPOWER-Lung 3 part 2
+required_cols <- c("HR", "LCI", "UCI", "control_type", "treatment_type1", "Trial.name","treatment_type", "N_E", "N_C")
+dat$HR  <- suppressWarnings(as.numeric(dat$HR))
+dat$LCI <- suppressWarnings(as.numeric(dat$LCI))
+dat$UCI <- suppressWarnings(as.numeric(dat$UCI))
+sub <- subset(dat, control_type == "CT" & !is.na(treatment_type1))
+
+# 反推缺失HR
+has_log_cols <- all(c("logHR", "SE(logHR)") %in% colnames(sub))
+if (has_log_cols) {
+  idx_need <- is.na(sub$HR) & !is.na(sub$logHR) & !is.na(sub$`SE(logHR)`)
+  if (any(idx_need)) {
+    sub$HR[idx_need]  <- exp(sub$logHR[idx_need])
+    sub$LCI[idx_need] <- exp(sub$logHR[idx_need] - 1.96 * sub$`SE(logHR)`[idx_need])
+    sub$UCI[idx_need] <- exp(sub$logHR[idx_need] + 1.96 * sub$`SE(logHR)`[idx_need])
+  }
+}
+
+# 过滤有效数据
+sub <- sub[complete.cases(sub$HR, sub$LCI, sub$UCI), ]
+sub <- sub[sub$HR > 0 & sub$LCI > 0 & sub$UCI > 0, ]
+sub$TE   <- log(sub$HR)
+sub$seTE <- (log(sub$UCI) - log(sub$LCI)) / (2 * 1.96)
+sub <- sub[is.finite(sub$TE) & is.finite(sub$seTE) & sub$seTE > 0, ]
+
+# 3. 剔除异质性来源研究 EMPOWER-Lung 3 part 2
+sub_excl <- subset(sub, Trial.name != "EMPOWER-Lung 3 part 2")
+if (nrow(sub_excl) < 2) stop("剔除后研究不足2项，无法绘图")
+
+# 4. 构建HK随机效应meta模型（和原图模型一致 hakn=T）
+mg_excl <- metagen(
+  TE = TE,
+  seTE = seTE,
+  studlab = `Trial.name`,
+  sm = "HR",
+  n.e = N_E,
+  n.c  = N_C,
+  method.tau = "DL",
+  hakn = TRUE,    # Hartung-Knapp校正，对应图中(HK)
+  fixed = FALSE,
+  prediction = FALSE,
+  data = sub_excl
+)
+
+# 5. 【核心绘图代码】
+excl_plot_name <- "forest_plots/excl_outlier/forest_Pain_matched_style.pdf"
+# 使用cairo_pdf规避字体报错
+cairo_pdf(excl_plot_name, width = 14, height = 8, family = "Arial")
+forest(mg_excl)
+dev.off()
+cat("✅ 复刻样式森林图已保存：", excl_plot_name, "\n")
+summary(mg_excl)
+```
+
+#做剔除影响异质性的研究后的森林图，食欲不佳中的研究是MYSTIC(D)和EMPOWER-Lung 1
+```{r}
+library(readxl)
+library(meta)
+
+# 1. 文件路径与文件夹创建
+excel_file <- "D:/meta分析/9.1network meta/2026.6.23/整合版数据6.23_TTD_新增n_event.xlsx"
+dir.create("forest_plots/excl_outlier", recursive = TRUE, showWarnings = FALSE)
+
+# 2. 单独读取Pain工作表并清洗（和你循环筛选逻辑完全统一）
+dat <- read_excel(excel_file, sheet = "Appetite Loss")#做剔除影响异质性的研究后的森林图，pain中的研究是EMPOWER-Lung 3 part 2
+required_cols <- c("HR", "LCI", "UCI", "control_type", "treatment_type1", "Trial.name","treatment_type", "N_E", "N_C")
+dat$HR  <- suppressWarnings(as.numeric(dat$HR))
+dat$LCI <- suppressWarnings(as.numeric(dat$LCI))
+dat$UCI <- suppressWarnings(as.numeric(dat$UCI))
+sub <- subset(dat, control_type == "CT" & !is.na(treatment_type1))
+
+# 反推缺失HR
+has_log_cols <- all(c("logHR", "SE(logHR)") %in% colnames(sub))
+if (has_log_cols) {
+  idx_need <- is.na(sub$HR) & !is.na(sub$logHR) & !is.na(sub$`SE(logHR)`)
+  if (any(idx_need)) {
+    sub$HR[idx_need]  <- exp(sub$logHR[idx_need])
+    sub$LCI[idx_need] <- exp(sub$logHR[idx_need] - 1.96 * sub$`SE(logHR)`[idx_need])
+    sub$UCI[idx_need] <- exp(sub$logHR[idx_need] + 1.96 * sub$`SE(logHR)`[idx_need])
+  }
+}
+
+# 过滤有效数据
+sub <- sub[complete.cases(sub$HR, sub$LCI, sub$UCI), ]
+sub <- sub[sub$HR > 0 & sub$LCI > 0 & sub$UCI > 0, ]
+sub$TE   <- log(sub$HR)
+sub$seTE <- (log(sub$UCI) - log(sub$LCI)) / (2 * 1.96)
+sub <- sub[is.finite(sub$TE) & is.finite(sub$seTE) & sub$seTE > 0, ]
+
+# 3. 剔除异质性来源研究 MYSTIC(D),EMPOWER-Lung 1
+sub_excl <- subset(sub, Trial.name != "EMPOWER-Lung 1" & Trial.name != "MYSTIC(D)")
+if (nrow(sub_excl) < 2) stop("剔除后研究不足2项，无法绘图")
+
+# 4. 构建HK随机效应meta模型（和原图模型一致 hakn=T）
+mg_excl <- metagen(
+  TE = TE,
+  seTE = seTE,
+  studlab = `Trial.name`,
+  sm = "HR",
+  n.e = N_E,
+  n.c  = N_C,
+  method.tau = "DL",
+  hakn = TRUE,    # Hartung-Knapp校正，对应图中(HK)
+  fixed = FALSE,
+  prediction = FALSE,
+  data = sub_excl
+)
+
+# 5. 【核心绘图代码】
+excl_plot_name <- "forest_plots/excl_outlier/forest_Appetite_Loss_matched_style.pdf"
+# 使用cairo_pdf规避字体报错
+cairo_pdf(excl_plot_name, width = 14, height = 8, family = "Arial")
+forest(mg_excl)
+dev.off()
+cat("✅ 复刻样式森林图已保存：", excl_plot_name, "\n")
+summary(mg_excl)
+```
+
+#做剔除影响异质性的研究后的森林图，恶心呕吐中的研究是EMPOWER-Lung 1
+```{r}
+library(readxl)
+library(meta)
+
+# 1. 文件路径与文件夹创建
+excel_file <- "D:/meta分析/9.1network meta/2026.6.23/整合版数据6.23_TTD_新增n_event.xlsx"
+dir.create("forest_plots/excl_outlier", recursive = TRUE, showWarnings = FALSE)
+
+# 2. 单独读取Pain工作表并清洗（和你循环筛选逻辑完全统一）
+dat <- read_excel(excel_file, sheet = "NV")#做剔除影响异质性的研究后的森林图，pain中的研究是EMPOWER-Lung 3 part 2
+required_cols <- c("HR", "LCI", "UCI", "control_type", "treatment_type1", "Trial.name","treatment_type", "N_E", "N_C")
+dat$HR  <- suppressWarnings(as.numeric(dat$HR))
+dat$LCI <- suppressWarnings(as.numeric(dat$LCI))
+dat$UCI <- suppressWarnings(as.numeric(dat$UCI))
+sub <- subset(dat, control_type == "CT" & !is.na(treatment_type1))
+
+# 反推缺失HR
+has_log_cols <- all(c("logHR", "SE(logHR)") %in% colnames(sub))
+if (has_log_cols) {
+  idx_need <- is.na(sub$HR) & !is.na(sub$logHR) & !is.na(sub$`SE(logHR)`)
+  if (any(idx_need)) {
+    sub$HR[idx_need]  <- exp(sub$logHR[idx_need])
+    sub$LCI[idx_need] <- exp(sub$logHR[idx_need] - 1.96 * sub$`SE(logHR)`[idx_need])
+    sub$UCI[idx_need] <- exp(sub$logHR[idx_need] + 1.96 * sub$`SE(logHR)`[idx_need])
+  }
+}
+
+# 过滤有效数据
+sub <- sub[complete.cases(sub$HR, sub$LCI, sub$UCI), ]
+sub <- sub[sub$HR > 0 & sub$LCI > 0 & sub$UCI > 0, ]
+sub$TE   <- log(sub$HR)
+sub$seTE <- (log(sub$UCI) - log(sub$LCI)) / (2 * 1.96)
+sub <- sub[is.finite(sub$TE) & is.finite(sub$seTE) & sub$seTE > 0, ]
+
+# 3. 剔除异质性来源研究 MYSTIC(D),EMPOWER-Lung 1
+sub_excl <- subset(sub, Trial.name != "EMPOWER-Lung 1")
+if (nrow(sub_excl) < 2) stop("剔除后研究不足2项，无法绘图")
+
+# 4. 构建HK随机效应meta模型（和原图模型一致 hakn=T）
+mg_excl <- metagen(
+  TE = TE,
+  seTE = seTE,
+  studlab = `Trial.name`,
+  sm = "HR",
+  n.e = N_E,
+  n.c  = N_C,
+  method.tau = "DL",
+  hakn = TRUE,    # Hartung-Knapp校正，对应图中(HK)
+  fixed = FALSE,
+  prediction = FALSE,
+  data = sub_excl
+)
+
+# 5. 【核心绘图代码】
+excl_plot_name <- "forest_plots/excl_outlier/forest_NV_matched_style.pdf"
+# 使用cairo_pdf规避字体报错
+cairo_pdf(excl_plot_name, width = 14, height = 8, family = "Arial")
+forest(mg_excl)
+dev.off()
+cat("✅ 复刻样式森林图已保存：", excl_plot_name, "\n")
+summary(mg_excl)
+```
